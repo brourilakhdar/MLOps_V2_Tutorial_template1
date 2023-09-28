@@ -1,8 +1,6 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-name: deploy-model-training-pipeline
-
 variables:
   - template: ../../config-aml.yml
   - ${{ if eq(variables['Build.SourceBranchName'], 'main') }}:
@@ -27,10 +25,10 @@ resources:
       ref: main
 
 stages:
-  - stage: DeployTrainingPipeline
-    displayName: Deploy Training Pipeline
+  - stage: DeployBatchScoringPipeline
+    displayName: Deploy Batch Scoring Pipeline
     jobs:
-      - job: DeployTrainingPipeline
+      - job: DeployBatchScoringPipeline
         steps:
           - checkout: self
             path: s/
@@ -49,17 +47,14 @@ stages:
           - template: templates/${{ variables.version }}/connect-to-workspace.yml@mlops-templates
           - template: templates/${{ variables.version }}/create-environment.yml@mlops-templates
             parameters:
-              environment_name: $(training_env_name)
+              environment_name: $(batch_env_name)
               build_type: "conda"
-              environment_file: $(training_env_conda_yaml)
+              environment_file: $(batch_env_conda_yaml)
               enable_monitoring: $(enable_monitoring)
           - template: templates/${{ variables.version }}/register-dataset.yml@mlops-templates
             parameters:
-              data_type: training
-          - template: templates/${{ variables.version }}/get-compute.yml@mlops-templates
-            parameters:
-              compute_type: training
-          - template: templates/${{ variables.version }}/deploy-training-pipeline.yml@mlops-templates
+              data_type: scoring
+          - template: templates/${{ variables.version }}/deploy-batch-scoring-pipeline.yml@mlops-templates
             parameters:
               enable_monitoring: $(enable_monitoring)
           - template: templates/${{ variables.version }}/add-pipeline-to-endpoint.yml@mlops-templates

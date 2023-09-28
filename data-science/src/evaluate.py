@@ -1,191 +1,209 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
-"""
-Evaluates trained ML model using test dataset.
-Saves predictions, evaluation results and deploy flag.
-"""
 
+import os
+import sys
 import argparse
-from pathlib import Path
-
-import numpy as np
+import joblib
 import pandas as pd
-from matplotlib import pyplot as plt
-
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 
 import mlflow
 import mlflow.sklearn
-import mlflow.pyfunc
-from mlflow.tracking import MlflowClient
 
-TARGET_COL = "cost"
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import StandardScaler
+from sklearn import metrics
 
-NUMERIC_COLS = [
-    "distance",
-    "dropoff_latitude",
-    "dropoff_longitude",
-    "passengers",
-    "pickup_latitude",
-    "pickup_longitude",
-    "pickup_weekday",
-    "pickup_month",
-    "pickup_monthday",
-    "pickup_hour",
-    "pickup_minute",
-    "pickup_second",
-    "dropoff_weekday",
-    "dropoff_month",
-    "dropoff_monthday",
-    "dropoff_hour",
-    "dropoff_minute",
-    "dropoff_second",
-]
+from fairlearn.metrics._group_metric_set import _create_group_metric_set
+from azureml.contrib.fairness import upload_dashboard_dictionary, download_dashboard_by_upload_id
 
-CAT_NOM_COLS = [
-    "store_forward",
-    "vendor",
-]
+from interpret_community import TabularExplainer
+from azureml.interpret import ExplanationClient
 
-CAT_ORD_COLS = [
-]
+from azureml.core import Run, Model
+run = Run.get_context()
+ws = run.experiment.workspace
 
 def parse_args():
-    '''Parse input arguments'''
+    parser = argparse.ArgumentParser(description="UCI Credit example")
+    parser.add_argument("--prepared_data_path", type=str, default='prepared_data/', help="Directory path to training data")
+    parser.add_argument('--model_name', type=str, help='Name under which model is registered')
+    parser.add_argument("--model_path", type=str, default='trained_model/', help="Model output directory")
+    parser.add_argument("--explainer_path", type=str, default='trained_model/', help="Model output directory")
+    parser.add_argument("--evaluation_path", type=str, default='evaluation_results/', help="Evaluation results output directory")
+    parser.add_argument('--deploy_flag', type=str, help='A deploy flag whether to deploy or no')
+    return parser.parse_args()
 
-    parser = argparse.ArgumentParser("predict")
-    parser.add_argument("--model_name", type=str, help="Name of registered model")
-    parser.add_argument("--model_input", type=str, help="Path of input model")
-    parser.add_argument("--test_data", type=str, help="Path to test dataset")
-    parser.add_argument("--evaluation_output", type=str, help="Path of eval results")
-    parser.add_argument("--runner", type=str, help="Local or Cloud Runner", default="CloudRunner")
+def main():
+    # Parse command-line arguments
+    args = parse_args()
+    prepared_data_path = args.prepared_data_path
+    model_path = args.model_path
+    explainer_path = args.explainer_path
+    evaluation_path = args.evaluation_path
 
-    args = parser.parse_args()
+    # Make sure evaluation output path exists
+    if not os.path.exists(evaluation_path):
+        os.makedirs(evaluation_path)
+        
+    # Make sure explainer output path exists
+    if not os.path.exists(explainer_path):
+        os.makedirs(explainer_path)
 
-    return args
-
-def main(args):
-    '''Read trained model and test dataset, evaluate model and save result'''
-
-    # Load the test data
-    test_data = pd.read_parquet(Path(args.test_data))
-
-    # Split the data into inputs and outputs
-    y_test = test_data[TARGET_COL]
-    X_test = test_data[NUMERIC_COLS + CAT_NOM_COLS + CAT_ORD_COLS]
-
-    # Load the model from input port
-    model =  mlflow.sklearn.load_model(args.model_input) 
+    # Enable auto logging
+    mlflow.sklearn.autolog()
+    
+    # Read training & testing data
+    print(os.path.join(prepared_data_path, 'train.csv'))
+    train = pd.read_csv(os.path.join(prepared_data_path, 'train.csv'))
+    train.drop("Sno", axis=1, inplace=True)
+    y_train = train['Risk']
+    X_train = train.drop('Risk', axis=1)
+    
+    test = pd.read_csv(os.path.join(prepared_data_path, 'test.csv'))
+    test.drop("Sno", axis=1, inplace=True)
+    y_test = test['Risk']
+    X_test = test.drop('Risk', axis=1)
+    
+    run.log('TEST SIZE', test.shape[0])
+    
+    # Load model
+    model = joblib.load(os.path.join(model_path, 'model.pkl'))
 
     # ---------------- Model Evaluation ---------------- #
-    yhat_test, score = model_evaluation(X_test, y_test, model, args.evaluation_output)
-
-    # ----------------- Model Promotion ---------------- #
-    if args.runner == "CloudRunner":
-        predictions, deploy_flag = model_promotion(args.model_name, args.evaluation_output, X_test, y_test, yhat_test, score)
-
-
-
-def model_evaluation(X_test, y_test, model, evaluation_output):
-
-    # Get predictions to y_test (y_test)
-    yhat_test = model.predict(X_test)
-
-    # Save the output data with feature columns, predicted cost, and actual cost in csv file
-    output_data = X_test.copy()
-    output_data["real_label"] = y_test
-    output_data["predicted_label"] = yhat_test
-    output_data.to_csv((Path(evaluation_output) / "predictions.csv"))
-
-    # Evaluate Model performance with the test set
-    r2 = r2_score(y_test, yhat_test)
-    mse = mean_squared_error(y_test, yhat_test)
-    rmse = np.sqrt(mse)
-    mae = mean_absolute_error(y_test, yhat_test)
-
-    # Print score report to a text file
-    (Path(evaluation_output) / "score.txt").write_text(
-        f"Scored with the following model:\n{format(model)}"
-    )
-    with open((Path(evaluation_output) / "score.txt"), "a") as outfile:
-        outfile.write("Mean squared error: {mse.2f} \n")
-        outfile.write("Root mean squared error: {rmse.2f} \n")
-        outfile.write("Mean absolute error: {mae.2f} \n")
-        outfile.write("Coefficient of determination: {r2.2f} \n")
-
-    mlflow.log_metric("test r2", r2)
-    mlflow.log_metric("test mse", mse)
-    mlflow.log_metric("test rmse", rmse)
-    mlflow.log_metric("test mae", mae)
-
-    # Visualize results
-    plt.scatter(y_test, yhat_test,  color='black')
-    plt.plot(y_test, y_test, color='blue', linewidth=3)
-    plt.xlabel("Real value")
-    plt.ylabel("Predicted value")
-    plt.title("Comparing Model Predictions to Real values - Test Data")
-    plt.savefig("predictions.png")
-    mlflow.log_artifact("predictions.png")
-
-    return yhat_test, r2
-
-def model_promotion(model_name, evaluation_output, X_test, y_test, yhat_test, score):
+    # Evaluate model using testing set
     
-    scores = {}
-    predictions = {}
+    # Capture Accuracy Score
+    test_acc = model.score(X_test, y_test)
 
-    client = MlflowClient()
+    # Capture ML Metrics
+    test_metrics = {
+        "Test Accuracy": metrics.accuracy_score(y_test, model.predict(X_test)),
+        "Test Recall": metrics.recall_score(y_test, model.predict(X_test), pos_label="good"),
+        "Test Precison": metrics.precision_score(y_test, model.predict(X_test), pos_label="good"),
+        "Test F1 Score": metrics.f1_score(y_test, model.predict(X_test), pos_label="good")
+    }
 
-    for model_run in client.search_model_versions(f"name='{model_name}'"):
-        model_version = model_run.version
-        mdl = mlflow.pyfunc.load_model(
-            model_uri=f"models:/{model_name}/{model_version}")
-        predictions[f"{model_name}:{model_version}"] = mdl.predict(X_test)
-        scores[f"{model_name}:{model_version}"] = r2_score(
-            y_test, predictions[f"{model_name}:{model_version}"])
+    # Capture Confusion Matrix
+    test_cm = metrics.plot_confusion_matrix(model, X_test, y_test)
 
-    if scores:
-        if score >= max(list(scores.values())):
+    # Save and test eval metrics
+    print("Testing accuracy: %.3f" % test_acc)
+    run.log('Testing accuracy', test_acc)
+    run.parent.log('Testing accuracy', test_acc)
+    with open(os.path.join(evaluation_path, "metrics.json"), 'w+') as f:
+        json.dump(test_metrics, f)
+    test_cm.figure_.savefig(os.path.join(evaluation_path, "confusion_matrix.jpg"))
+    test_cm.figure_.savefig("confusion_matrix.jpg")
+    run.log_image(name='Confusion Matrix Test Dataset', path="confusion_matrix.jpg")
+    run.parent.log_image(name='Confusion Matrix Test Dataset', path="confusion_matrix.jpg")
+
+    
+    # -------------------- Promotion ------------------- #
+    test_accuracies = {}
+    test_predictions = {}
+    labels_dict = {"good": int(1), "bad": int(0)}
+    y_test_labels = [labels_dict[x] for x in y_test]
+    
+    for model_run in Model.list(ws):
+        if model_run.name == args.model_name:
+            mdl_path = Model.download(model_run, exist_ok=True)
+
+            if 'model.pkl' in mdl_path:
+                mdl = joblib.load(mdl_path)
+            else:
+                mdl = joblib.load(os.path.join(mdl_path, 'model.pkl'))
+            
+            test_accuracies[model_run.id] = mdl.score(X_test, y_test)
+            test_predictions[model_run.id] = [labels_dict[x] for x in mdl.predict(X_test)]
+     
+    if test_accuracies:
+        if test_acc >= max(list(test_accuracies.values())):
             deploy_flag = 1
         else:
             deploy_flag = 0
     else:
         deploy_flag = 1
-    print(f"Deploy flag: {deploy_flag}")
+            
+    with open(args.deploy_flag, 'w') as f:
+        f.write('%d' % int(deploy_flag))
+        
+    run.log('deploy flag', bool(deploy_flag))
+    run.parent.log('deploy flag', bool(deploy_flag))
+        
+    test_accuracies["current model"] = test_acc
+    model_runs_metrics_plot = pd.DataFrame(test_accuracies, index=["accuracy"]).plot(kind='bar', figsize=(15, 10))
+    model_runs_metrics_plot.figure.savefig(os.path.join(evaluation_path, "model_runs_metrics_plot.png"))    
+    model_runs_metrics_plot.figure.savefig("model_runs_metrics_plot.png")    
+    run.log_image(name='MODEL RUNS METRICS COMPARISON', path="model_runs_metrics_plot.png")
+    run.parent.log_image(name='MODEL RUNS METRICS COMPARISON', path="model_runs_metrics_plot.png")
 
-    with open((Path(evaluation_output) / "deploy_flag"), 'w') as outfile:
-        outfile.write(f"{int(deploy_flag)}")
+    # -------------------- FAIRNESS ------------------- #
+    # Calculate Fairness Metrics over Sensitive Features
+    # Create a dictionary of model(s) you want to assess for fairness 
+    
+    sensitive_features = ["Sex"]
+    sf = { col: X_test[[col]] for col in sensitive_features }
+    test_predictions["currrent model"] = [labels_dict[x] for x in model.predict(X_test)]
+    
+    dash_dict_all = _create_group_metric_set(y_true=y_test_labels,
+                                             predictions=test_predictions,
+                                             sensitive_features=sf,
+                                             prediction_type='binary_classification',
+                                            )
+    
+    # Upload the dashboard to Azure Machine Learning
+    dashboard_title = "Fairness insights Comparison of Models"
+    # Set validate_model_ids parameter of upload_dashboard_dictionary to False if you have not registered your model(s)
+    upload_id = upload_dashboard_dictionary(run,
+                                            dash_dict_all,
+                                            dashboard_name=dashboard_title,
+                                            validate_model_ids=False)
+    print("\nUploaded to id: {0}\n".format(upload_id))
 
-    # add current model score and predictions
-    scores["current model"] = score
-    predictions["currrent model"] = yhat_test
+    upload_id_pipeline = upload_dashboard_dictionary(run.parent,
+                                            dash_dict_all,
+                                            dashboard_name=dashboard_title,
+                                            validate_model_ids=False)
+    print("\nUploaded to id: {0}\n".format(upload_id_pipeline))
+    
+    
+    # -------------------- Explainability ------------------- #
+    tabular_explainer = TabularExplainer(model.steps[-1][1],
+                                     initialization_examples=X_train,
+                                     features=X_train.columns,
+                                     classes=[0, 1],
+                                     transformations=model.steps[0][1])
+                                     
+    joblib.dump(tabular_explainer, os.path.join(explainer_path, "explainer"))
 
-    perf_comparison_plot = pd.DataFrame(
-        scores, index=["r2 score"]).plot(kind='bar', figsize=(15, 10))
-    perf_comparison_plot.figure.savefig("perf_comparison.png")
-    perf_comparison_plot.figure.savefig(Path(evaluation_output) / "perf_comparison.png")
+    # you can use the training data or the test data here, but test data would allow you to use Explanation Exploration
+    global_explanation = tabular_explainer.explain_global(X_test)
 
-    mlflow.log_metric("deploy flag", bool(deploy_flag))
-    mlflow.log_artifact("perf_comparison.png")
+    # if the PFIExplainer in the previous step, use the next line of code instead
+    # global_explanation = explainer.explain_global(x_train, true_labels=y_train)
 
-    return predictions, deploy_flag
+    # sorted feature importance values and feature names
+    sorted_global_importance_values = global_explanation.get_ranked_global_values()
+    sorted_global_importance_names = global_explanation.get_ranked_global_names()
+
+    print("Explainability feature importance:")
+    # alternatively, you can print out a dictionary that holds the top K feature names and values
+    global_explanation.get_feature_importance_dict()
+    
+    client = ExplanationClient.from_run(run)
+    client.upload_model_explanation(global_explanation, comment='global explanation: all features')
+
+    # upload dashboard to parent run
+    client_parent = ExplanationClient.from_run(run.parent)
+    client_parent.upload_model_explanation(global_explanation, comment='global explanation: all features')
+    
 
 if __name__ == "__main__":
-
-    mlflow.start_run()
-
-    args = parse_args()
-
-    lines = [
-        f"Model name: {args.model_name}",
-        f"Model path: {args.model_input}",
-        f"Test data path: {args.test_data}",
-        f"Evaluation output path: {args.evaluation_output}",
-    ]
-
-    for line in lines:
-        print(line)
-    
-    main(args)
-
-    mlflow.end_run()
+    main()
