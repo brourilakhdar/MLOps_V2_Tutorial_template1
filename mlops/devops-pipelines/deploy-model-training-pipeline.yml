@@ -4,7 +4,6 @@
 name: deploy-model-training-pipeline
 
 variables:
-  - template: ../../config-aml.yml
   - ${{ if eq(variables['Build.SourceBranchName'], 'main') }}:
       # 'main' branch: PRD environment
       - template: ../../config-infra-prod.yml
@@ -12,12 +11,12 @@ variables:
       # 'develop' or feature branches: DEV environment
       - template: ../../config-infra-dev.yml
   - name: version
-    value: python-sdk-v1
+    value: aml-cli-v2
 
 trigger: none
 
 pool:
-  vmImage: $(ap_vm_image)
+  vmImage: ubuntu-20.04
 
 resources:
   repositories:
@@ -31,11 +30,12 @@ stages:
     displayName: Deploy Training Pipeline
     jobs:
       - job: DeployTrainingPipeline
+        timeoutInMinutes: 120 # how long to run the job before automatically cancelling
         steps:
           - checkout: self
             path: s/
           - task: Bash@3
-            displayName: "Create checkout repository folder(s)"
+            displayName: "Prevent repos dir warnings"
             inputs:
               targetType: "inline"
               script: |
@@ -47,20 +47,25 @@ stages:
           - template: templates/${{ variables.version }}/install-az-cli.yml@mlops-templates
           - template: templates/${{ variables.version }}/install-aml-cli.yml@mlops-templates
           - template: templates/${{ variables.version }}/connect-to-workspace.yml@mlops-templates
-          - template: templates/${{ variables.version }}/create-environment.yml@mlops-templates
+          - template: templates/${{ variables.version }}/register-environment.yml@mlops-templates
             parameters:
-              environment_name: $(training_env_name)
-              build_type: "conda"
-              environment_file: $(training_env_conda_yaml)
-              enable_monitoring: $(enable_monitoring)
-          - template: templates/${{ variables.version }}/register-dataset.yml@mlops-templates
+              environment_name: taxi-train-env
+              environment_file: mlops/azureml/train/train-env.yml
+          - template: templates/${{ variables.version }}/create-compute.yml@mlops-templates
             parameters:
-              data_type: training
-          - template: templates/${{ variables.version }}/get-compute.yml@mlops-templates
+              cluster_name: cpu-cluster
+              size: Standard_DS3_v2
+              min_instances: 0
+              max_instances: 4
+              cluster_tier: low_priority
+          - template: templates/${{ variables.version }}/register-data.yml@mlops-templates
             parameters:
-              compute_type: training
-          - template: templates/${{ variables.version }}/deploy-training-pipeline.yml@mlops-templates
-            parameters:
-              enable_monitoring: $(enable_monitoring)
-          - template: templates/${{ variables.version }}/add-pipeline-to-endpoint.yml@mlops-templates
+              data_type: uri_file
+              data_name: taxi-data
+              data_file: mlops/azureml/train/data.yml
           - template: templates/${{ variables.version }}/run-pipeline.yml@mlops-templates
+            parameters:
+              pipeline_file: mlops/azureml/train/pipeline.yml
+              experiment_name: $(environment)_taxi_fare_train_$(Build.SourceBranchName)
+              display_name: $(environment)_taxi_fare_run_$(Build.BuildID)
+              enable_monitoring: $(enable_monitoring)
